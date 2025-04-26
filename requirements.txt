@@ -1,0 +1,7 @@
+streamlit
+pandas
+openpyxl
+requests
+aiohttp
+nest_asyncio
+add requirements.txt
