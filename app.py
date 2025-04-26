@@ -1,177 +1,101 @@
 import streamlit as st
-import requests
 import pandas as pd
+import smtplib
+import socket
+import dns.resolver
 import time
-import os
-from dotenv import load_dotenv
+from email_validator import validate_email
 
-# 初始化环境
-load_dotenv()
+# 配置SMTP参数（需自定义）
+SMTP_HELO_DOMAIN = "yourdomain.com"  # 改为你的域名
+SMTP_FROM_EMAIL = "verify@yourdomain.com"  # 改为你的验证邮箱
+SMTP_TIMEOUT = 10  # 超时时间（秒）
 
-# --- 安全配置区 ---
-def get_api_key():
-    """安全获取API Key（优先级：环境变量 > secrets > 手动输入）"""
-    # 1. 从环境变量获取
-    key = os.getenv("HUNTER_API_KEY")
-    if key and key.startswith("hunter_"):
-        return key
-    
-    # 2. 从Streamlit Secrets获取
-    try:
-        key = st.secrets["HUNTER_API_KEY"]
-        if key and key.startswith("hunter_"):
-            return key
-    except:
-        pass
-    
-    # 3. 手动输入
-    key = st.text_input(
-        "🔑 输入Hunter.io API Key（以'hunter_'开头）", 
-        type="password",
-        help="获取地址：https://hunter.io/account"
-    )
-    if key and key.startswith("hunter_"):
-        return key
-    
-    st.error("❌ 无效的API Key格式！请确认密钥以'hunter_'开头")
-    st.stop()
-
-API_KEY = get_api_key()
-
-# --- 核心验证函数 ---
-def verify_email(email):
-    """验证单个邮箱的可达性"""
-    try:
-        # 发送请求到Hunter.io
-        response = requests.get(
-            "https://api.hunter.io/v2/email-verifier",
-            params={
-                "email": email.strip(),
-                "api_key": API_KEY
-            },
-            timeout=10
-        )
-        
-        # 检查HTTP状态码
-        if response.status_code == 401:
-            return {
-                'email': email,
-                'valid': False,
-                'details': "API Key无效或已过期",
-                'response': None
-            }
-        
-        response.raise_for_status()
-        data = response.json().get('data', {})
-        
-        return {
-            'email': email,
-            'valid': data.get('status') == 'valid',
-            'details': f"{data.get('result', 'unknown')} (可信度: {data.get('score', 'N/A')}%)",
-            'response': data  # 原始响应用于调试
-        }
-        
-    except Exception as e:
-        return {
-            'email': email,
-            'valid': False,
-            'details': f"验证失败: {str(e)}",
-            'response': None
-        }
-
-# --- Streamlit界面 ---
+# 页面设置
 st.set_page_config(
-    page_title="专业邮箱验证工具",
+    page_title="SMTP邮箱验证工具",
     page_icon="✉️",
     layout="wide"
 )
-st.title("✉️ 专业邮箱验证（Hunter.io API）")
+st.title("✉️ 纯SMTP邮箱验证")
+
+# 核心验证函数
+def verify_email(email):
+    """通过SMTP协议验证邮箱"""
+    try:
+        # 1. 验证邮箱格式
+        email_info = validate_email(email, check_deliverability=False)
+        domain = email_info.domain
+
+        # 2. 查询MX记录
+        mx_records = dns.resolver.resolve(domain, 'MX')
+        mx_host = str(mx_records[0].exchange)
+
+        # 3. SMTP握手验证
+        with smtplib.SMTP(mx_host, timeout=SMTP_TIMEOUT) as server:
+            server.helo(SMTP_HELO_DOMAIN)
+            server.mail(SMTP_FROM_EMAIL)
+            code, msg = server.rcpt(email)
+            if code == 250:
+                return True, "SMTP验证通过"
+            return False, f"SMTP拒绝({code} {msg})"
+
+    except dns.resolver.NoAnswer:
+        return False, "无MX记录"
+    except dns.resolver.NXDOMAIN:
+        return False, "域名不存在"
+    except smtplib.SMTPServerBusy:
+        return False, "服务器繁忙"
+    except Exception as e:
+        return False, f"错误({str(e)})"
 
 # 文件上传
-uploaded_file = st.file_uploader(
-    "上传Excel文件（.xlsx格式）",
-    type=["xlsx"],
-    help="文件应包含邮箱列，最大支持200MB"
-)
+uploaded_file = st.file_uploader("上传Excel文件 (.xlsx)", type=["xlsx"])
 
 if uploaded_file:
     try:
-        # 读取Excel文件
         df = pd.read_excel(uploaded_file, engine='openpyxl')
-        st.success(f"成功读取文件，共 {len(df)} 条记录")
+        email_col = st.selectbox("选择邮箱列", df.columns)
         
-        # 选择邮箱列
-        email_col = st.selectbox(
-            "选择邮箱列",
-            options=df.columns,
-            index=0,
-            key="email_column"
-        )
-        
-        # 开始验证按钮
-        if st.button("🚀 开始验证", type="primary"):
+        if st.button("🚀 开始验证"):
             emails = df[email_col].dropna().astype(str).str.strip().unique()
             
-            # 免费版限制50次/月
-            if len(emails) > 50:
-                st.warning("Hunter.io免费版每月限制50次验证，本次仅验证前50个邮箱")
-                emails = emails[:50]
-            
-            # 验证进度
+            # 进度显示
             progress_bar = st.progress(0)
-            status_area = st.empty()
+            status_text = st.empty()
             results = []
             
             for i, email in enumerate(emails):
-                # 执行验证
-                result = verify_email(email)
-                results.append(result)
+                valid, details = verify_email(email)
+                results.append({
+                    "email": email,
+                    "valid": valid,
+                    "details": details
+                })
                 
                 # 更新进度
                 progress = (i + 1) / len(emails)
                 progress_bar.progress(progress)
-                
-                # 实时显示结果
-                status_area.markdown(f"""
+                status_text.markdown(f"""
                 **进度**: {i+1}/{len(emails)}  
-                **当前邮箱**: `{email}`  
-                **状态**: {'✅ 有效' if result['valid'] else '❌ 无效'}  
-                **详情**: {result['details']}
+                **当前**: `{email}` → {'✅' if valid else '❌'} {details}
                 """)
                 
-                # 遵守API速率限制（免费版1次/秒）
-                time.sleep(1.2)
+                time.sleep(1)  # 避免频繁请求被屏蔽
             
-            # 显示最终结果
-            st.balloons()
+            # 显示结果
             result_df = pd.DataFrame(results)
-            
-            # 统计信息
-            col1, col2 = st.columns(2)
-            col1.metric("有效邮箱", result_df['valid'].sum())
-            col2.metric("无效邮箱", len(result_df) - result_df['valid'].sum())
-            
-            # 结果表格
-            st.dataframe(
-                result_df[['email', 'valid', 'details']],
-                height=400,
-                use_container_width=True
-            )
-            
-            # 下载按钮
+            st.success(f"验证完成！有效邮箱: {result_df['valid'].sum()}/{len(result_df)}")
+            st.dataframe(result_df)
+
+            # 下载结果
             st.download_button(
                 "📥 下载验证结果",
                 result_df.to_csv(index=False).encode('utf-8'),
-                "邮箱验证结果.csv",
-                mime='text/csv'
+                "smtp_verification_results.csv"
             )
             
-            # 调试信息（可选）
-            with st.expander("原始响应数据（调试用）"):
-                st.json([r['response'] for r in results if r['response']])
-    
     except Exception as e:
         st.error(f"文件处理错误: {str(e)}")
-
 else:
     st.info("请上传Excel文件以开始验证")
