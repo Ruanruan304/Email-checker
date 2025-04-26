@@ -1,130 +1,133 @@
 import pandas as pd
 import streamlit as st
-import socket
 import smtplib
-from email_validator import validate_email, EmailNotValidError
 import time
+import dns.resolver
+from email_validator import validate_email
+from concurrent.futures import ThreadPoolExecutor
 
-# 页面配置
+# ==================== 配置区 ====================
+SMTP_HELO_DOMAIN = "yourdomain.com"  # 改为你的域名
+SMTP_FROM_EMAIL = "verify@yourdomain.com"  # 改为你的验证邮箱
+MAX_THREADS = 3  # 并发线程数（建议3-5）
+TIMEOUT = 20  # 单次验证超时时间（秒）
+MAX_RETRIES = 2  # 失败重试次数
+
+# ==================== 页面设置 ====================
 st.set_page_config(
-    page_title="邮箱可达性验证（SMTP调试版）",
+    page_title="专业邮箱可达性验证",
     layout="wide",
-    page_icon="📩"
+    page_icon="✉️"
 )
+st.title("✉️ 专业邮箱可达性验证")
+st.markdown("""
+<style>
+    .stAlert { padding: 20px !important; }
+    .st-b7 { color: #ff4b4b !important; }
+</style>
+""", unsafe_allow_html=True)
 
-# 标题和说明
-st.title("📩 邮箱可达性验证（SMTP调试版）")
-st.warning("""
-**操作说明**：
-1. 上传包含邮箱的Excel文件（建议先测试3-5个邮箱）
-2. 系统将显示实时验证过程和结果
-3. 遇到错误请查看右侧日志面板
-""")
-
-# 创建日志输出区域
-log_container = st.expander("🔍 实时验证日志", expanded=True)
-log_output = log_container.empty()
-
-# 文件上传
-uploaded_file = st.file_uploader(
-    "上传Excel文件（.xlsx格式）",
-    type=["xlsx"],
-    help="请确保文件大小不超过10MB"
-)
-
-def log_message(message):
-    """实时输出日志"""
-    log_output.markdown(f"`{time.strftime('%H:%M:%S')}` - {message}")
-
-def verify_email(email):
-    """增强版邮箱验证函数"""
-    try:
-        # 格式验证
-        email_info = validate_email(email, check_deliverability=False)
-        domain = email_info.domain
-        log_message(f"开始验证: {email} (域名: {domain})")
-        
-        # MX记录查询
+# ==================== 核心验证函数 ====================
+def verify_email_smtp(email):
+    """增强版SMTP验证（含重试机制）"""
+    for attempt in range(MAX_RETRIES + 1):
         try:
-            mx_records = socket.getaddrinfo(domain, 25, socket.AF_INET)
-            if not mx_records:
-                log_message(f"{email} - 无MX记录")
-                return email, False, "无MX记录"
-            mx_host = mx_records[0][4][0]
-            log_message(f"{email} - 找到MX服务器: {mx_host}")
-        except socket.gaierror:
-            log_message(f"{email} - 域名解析失败")
-            return email, False, "域名解析失败"
-        
-        # SMTP验证
-        try:
-            with smtplib.SMTP(mx_host, timeout=10) as server:
-                server.helo('example.com')
-                server.mail('test@example.com')
+            # 1. 验证邮箱格式
+            email_info = validate_email(email, check_deliverability=False)
+            domain = email_info.domain
+            
+            # 2. 查询MX记录（使用dnspython）
+            mx_records = dns.resolver.resolve(domain, 'MX')
+            mx_host = str(mx_records[0].exchange)
+            
+            # 3. SMTP握手验证
+            with smtplib.SMTP(mx_host, timeout=TIMEOUT) as server:
+                server.set_debuglevel(0)
+                server.helo(SMTP_HELO_DOMAIN)
+                server.mail(SMTP_FROM_EMAIL)
                 code, msg = server.rcpt(email)
                 if code == 250:
-                    log_message(f"{email} - ✅ 可达 (响应: {code} {msg})")
                     return email, True, "可达"
-                else:
-                    log_message(f"{email} - ❌ 拒绝 (响应: {code} {msg})")
-                    return email, False, f"SMTP拒绝({code})"
+                return email, False, f"SMTP拒绝({code})"
+                
+        except dns.resolver.NoAnswer:
+            return email, False, "无MX记录"
+        except dns.resolver.NXDOMAIN:
+            return email, False, "域名不存在"
+        except smtplib.SMTPServerBusy:
+            time.sleep(5)
+            continue
         except Exception as e:
-            log_message(f"{email} - ❌ SMTP错误: {str(e)}")
-            return email, False, str(e)
-            
-    except EmailNotValidError as e:
-        log_message(f"{email} - ❌ 格式无效: {str(e)}")
-        return email, False, str(e)
-    except Exception as e:
-        log_message(f"{email} - ❌ 验证异常: {str(e)}")
-        return email, False, str(e)
+            if attempt == MAX_RETRIES:
+                return email, False, f"错误({str(e)})"
+            time.sleep(3)
+    return email, False, "验证超时"
 
-if uploaded_file is not None:
+# ==================== API验证方案 ====================
+def verify_email_api(email):
+    """使用Hunter.io API验证（需注册）"""
+    API_KEY = "YOUR_API_KEY"  # 在此替换你的API密钥
     try:
-        # 读取文件
-        log_message("正在读取Excel文件...")
-        df = pd.read_excel(uploaded_file, engine='openpyxl')
-        log_message(f"成功读取，共 {len(df)} 行数据")
-        
-        # 选择邮箱列
-        email_col = st.selectbox(
-            "选择邮箱列",
-            options=df.columns,
-            index=0,
-            key="email_column"
+        response = requests.get(
+            f"https://api.hunter.io/v2/email-verifier?email={email}&api_key={API_KEY}",
+            timeout=30
+        ).json()
+        status = response['data']['status']
+        return (
+            email,
+            status == 'valid',
+            response['data']['result']
         )
-        st.write("数据预览：", df.head(3))
-        
-        # 开始验证
-        if st.button("🚀 开始验证", type="primary"):
-            emails = df[email_col].dropna().astype(str).unique()
-            if len(emails) > 50:
-                st.warning("检测到超过50个邮箱，建议分批验证")
-                emails = emails[:50]  # 限制数量
-            
-            results = []
-            progress_bar = st.progress(0)
-            
-            for i, email in enumerate(emails):
-                results.append(verify_email(email))
-                progress_bar.progress((i + 1) / len(emails))
-            
-            # 显示结果
-            result_df = pd.DataFrame(
-                results,
-                columns=["邮箱", "是否可达", "详情"]
-            )
-            st.success("验证完成！")
-            st.dataframe(result_df)
-            
-            # 下载结果
-            st.download_button(
-                "📥 下载验证结果",
-                result_df.to_csv(index=False).encode('utf-8'),
-                "email_verification_results.csv",
-                mime='text/csv'
-            )
-            
     except Exception as e:
-        log_message(f"❌ 文件处理错误: {str(e)}")
-        st.error(f"文件处理出错: {str(e)}")
+        return email, False, f"API错误({str(e)})"
+
+# ==================== 主程序逻辑 ====================
+uploaded_file = st.file_uploader("上传Excel文件", type=["xlsx"])
+use_api = st.checkbox("使用API验证（更准确但需要密钥）")
+
+if uploaded_file:
+    df = pd.read_excel(uploaded_file, engine='openpyxl')
+    email_col = st.selectbox("选择邮箱列", df.columns)
+    
+    if st.button("开始验证", type="primary"):
+        emails = df[email_col].dropna().astype(str).unique()
+        if len(emails) > 100:
+            st.warning("检测到超过100个邮箱，将自动分批验证")
+            emails = emails[:100]
+        
+        # 选择验证方式
+        verify_func = verify_email_api if use_api else verify_email_smtp
+        
+        # 进度显示
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        results = []
+        
+        # 并发验证
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            for i, result in enumerate(executor.map(verify_func, emails)):
+                results.append(result)
+                progress = (i + 1) / len(emails)
+                progress_bar.progress(progress)
+                status_text.markdown(f"""
+                **进度**: {i+1}/{len(emails)}  
+                **当前**: `{result[0]}` → {result[2]}
+                """)
+        
+        # 显示结果
+        result_df = pd.DataFrame(results, columns=["邮箱", "有效", "详情"])
+        st.success("验证完成！成功率: {:.1f}%".format(
+            result_df["有效"].mean() * 100
+        ))
+        st.dataframe(result_df)
+        
+        # 下载结果
+        st.download_button(
+            "下载验证结果",
+            result_df.to_csv(index=False).encode('utf-8'),
+            "邮箱验证结果.csv"
+        )
+
+        # 显示统计
+        st.metric("有效邮箱", result_df["有效"].sum())
+        st.metric("无效邮箱", len(result_df) - result_df["有效"].sum())
